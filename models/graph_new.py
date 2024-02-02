@@ -5,7 +5,8 @@ from torch.nn import Module, Sequential, Linear, Conv1d, ModuleList
 from torch_scatter import scatter_sum, scatter_softmax
 from torch_geometric.nn import radius_graph, knn_graph
 # from models.common import GaussianSmearing, MLP, NONLINEARITIES
-
+# from torch_cluster import knn
+from models.common import batch_hybrid_edge_connection
 
 NONLINEARITIES = {
     "tanh": nn.Tanh(),
@@ -181,12 +182,12 @@ class EdgeBlock(Module):
         return h_bond
 
 
-class NodeEdgeNet(Module):
-    def __init__(self, node_dim, edge_dim, num_blocks, cutoff, use_gate, **kwargs):
+class MolDiff_new(Module):
+    def __init__(self, node_dim, num_blocks=6, cutoff=15, use_gate=True, **kwargs):
         super().__init__()
         self.node_dim = node_dim
-        self.edge_dim = edge_dim
-        self.num_blocks = num_blocks
+        self.edge_dim = 4
+        edge_dim = self.edge_dim
         self.cutoff = cutoff
         self.use_gate = use_gate
         self.kwargs = kwargs
@@ -205,7 +206,7 @@ class NodeEdgeNet(Module):
             input_edge_dim = num_gaussians
         else:
             self.update_edge = True  # default update edge
-            input_edge_dim = edge_dim + num_gaussians
+            input_edge_dim = self.edge_dim + num_gaussians
             
         if ('update_pos' in kwargs) and (not kwargs['update_pos']):
             self.update_pos = False
@@ -213,17 +214,26 @@ class NodeEdgeNet(Module):
             self.update_pos = True  # default update pos
         
         # node network
-        self.node_blocks_with_edge = ModuleList()
+        self.node_blocks_with_edge_1 = ModuleList()
         self.node_blocks_with_edge_2 = ModuleList()
+        self.node_blocks_with_edge_p = ModuleList()
+        self.node_blocks_with_edge_pl = ModuleList()
         self.edge_embs = ModuleList()
         self.edge_blocks = ModuleList()
-        self.pos_blocks = ModuleList()
+        self.pos_blocks_1 = ModuleList()
         self.pos_blocks_2 = ModuleList()
+        self.pos_blocks_pl = ModuleList()
         for _ in range(num_blocks):
-            self.node_blocks_with_edge.append(NodeBlock(
+            self.node_blocks_with_edge_1.append(NodeBlock(
                 node_dim=node_dim, edge_dim=edge_dim, hidden_dim=node_dim, use_gate=use_gate,
             ))
             self.node_blocks_with_edge_2.append(NodeBlock(
+                node_dim=node_dim, edge_dim=edge_dim, hidden_dim=node_dim, use_gate=use_gate,
+            ))
+            self.node_blocks_with_edge_p.append(NodeBlock(
+                node_dim=node_dim, edge_dim=edge_dim, hidden_dim=node_dim, use_gate=use_gate,
+            ))
+            self.node_blocks_with_edge_pl.append(NodeBlock(
                 node_dim=node_dim, edge_dim=edge_dim, hidden_dim=node_dim, use_gate=use_gate,
             ))
             
@@ -233,44 +243,90 @@ class NodeEdgeNet(Module):
                     edge_dim=edge_dim, node_dim=node_dim, use_gate=use_gate,
                 ))
             if self.update_pos:
-                self.pos_blocks.append(PosUpdate(
+                self.pos_blocks_1.append(PosUpdate(
                     node_dim=node_dim, edge_dim=edge_dim, hidden_dim=edge_dim, use_gate=use_gate,
                 ))
                 self.pos_blocks_2.append(PosUpdate(
                     node_dim=node_dim, edge_dim=edge_dim, hidden_dim=edge_dim, use_gate=use_gate,
                 ))
+                self.pos_blocks_pl.append(PosUpdate(
+                    node_dim=node_dim, edge_dim=edge_dim, hidden_dim=edge_dim, use_gate=use_gate,
+                ))
                 
-    def forward(self, h_node, pos_node, h_edge, edge_index, node_time, edge_time):
-        # 后1/3的edge翻转
-        edge_num = edge_index.shape[1]
+    # def forward(self, h_node, pos_node, h_edge, edge_index, node_time, edge_time):
+    def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False, time_step):
+        # edge_num = edge_index.shape[1]
+        pos_node = x
+        h_node = h
+        node_time = time_step.index_select(0, batch)
+
+        # four types of edge, L1, L2, PL, PP
+        four_type_edge_index, four_type_edge_batch = self._connect_edge(
+            x, mask_ligand, batch, loop=False)
+        edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p = four_type_edge_index
+        batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p = four_type_edge_batch
+        edge_time_l1 = time_step.index_select(0, batch_edge_l1)
+        edge_time_l2 = time_step.index_select(0, batch_edge_l2)
+        edge_time_pl = time_step.index_select(0, batch_edge_pl)
+        edge_time_p = time_step.index_select(0, batch_edge_p)
+        edge_time = torch.cat([edge_time_l1, edge_time_l2, edge_time_pl, edge_time_p], dim=0)
+        # total edge index
+        edge_index = torch.cat([edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p], dim=-1)
+        edge_type = self._build_edge_type(edge_index, mask_ligand)
+        mask_edge_l1 = torch.tensor(
+            [1] * edge_index_l1.shape[1] +
+            [0] * (edge_index_l2.shape[1] + edge_index_pl.shape[1] + edge_index_p.shape[1]),
+            dtype=torch.bool, device=edge_index.device
+        )
+        mask_edge_l2 = torch.tensor(
+            [0] * edge_index_l1.shape[1] +
+            [1] * edge_index_l2.shape[1] +
+            [0] * (edge_index_pl.shape[1] + edge_index_p.shape[1]), dtype=torch.bool, device=edge_index.device
+        )
+        mask_edge_pl = torch.tensor(
+            [0] * (edge_index_l1.shape[1] + edge_index_l2.shape[1]) +
+            [1] * edge_index_pl.shape[1] +
+            [0] * edge_index_p.shape[1], dtype=torch.bool, device=edge_index.device
+        )
+        mask_edge_p = torch.tensor(
+            [0] * (edge_index_l1.shape[1] + edge_index_l2.shape[1] + edge_index_pl.shape[1]) +
+            [1] * edge_index_p.shape[1], dtype=torch.bool, device=edge_index.device
+        )
+        
         for i in range(self.num_blocks):
             # edge fetures before each block
-            if self.update_pos or (i==0):
-                h_edge_dist, relative_vec, distance = self._build_edges_dist(pos_node, edge_index)
-            if self.update_edge:
-                h_edge = torch.cat([h_edge, h_edge_dist], dim=-1)
-            else:
-                h_edge = h_edge_dist
+            # if self.update_pos or (i==0):
+            h_edge_dist, relative_vec, distance = self._build_edges_dist(pos_node, edge_index)
+            # if self.update_edge:
+            #     h_edge = torch.cat([h_edge, h_edge_dist], dim=-1)
+            # else:
+            # 4 + 16
+            h_edge = torch.cat([h_edge, h_edge_dist], dim=-1)
             h_edge = self.edge_embs[i](h_edge)
 
             # node and edge feature updates
-            h_node_with_edge = self.node_blocks_with_edge[i](h_node, edge_index[:, :edge_num//2], h_edge[:edge_num//2], node_time)
+            h_node_with_edge_1 = self.node_blocks_with_edge_1[i](h_node, edge_index_l1, h_edge[mask_edge_l1], node_time)
             # 双向更新
-            h_node_with_edge_2 = self.node_blocks_with_edge_2[i](h_node, edge_index[:, edge_num//2:], h_edge[edge_num//2:], node_time)
-            # TODO: 创建pocket指向ligand的键，增加pocket对ligand节点的更新
+            h_node_with_edge_2 = self.node_blocks_with_edge_2[i](h_node, edge_index_l2, h_edge[mask_edge_l2], node_time)
+            # 更新pocket节点
+            h_node_with_edge_p = self.node_blocks_with_edge_p[i](h_node, edge_index_p, h_edge[mask_edge_p], node_time)
+            # pocket更新ligand节点
+            h_node_with_edge_pl = self.node_blocks_with_edge_pl[i](h_node, edge_index_pl, h_edge[mask_edge_pl], node_time)
             
             if self.update_edge:
                 h_edge = h_edge + self.edge_blocks[i](h_edge, edge_index, h_node, edge_time)
             # print(h_node_with_edge.shape, h_node_with_edge_2.shape)
-            h_node = h_node + h_node_with_edge + h_node_with_edge_2
+            h_node = h_node + h_node_with_edge_1 + h_node_with_edge_2 + h_node_with_edge_p + h_node_with_edge_pl
             # pos updates
             if self.update_pos:
                 # pos_node = pos_node + self.pos_blocks[i](h_node, h_edge, edge_index, relative_vec, distance, edge_time)
                 pos_node = (pos_node +
-                            self.pos_blocks[i](h_node, h_edge[:edge_num//2], edge_index[:, :edge_num//2], relative_vec[:edge_num//2], distance[:edge_num//2], edge_time[:edge_num//2]) +
-                            self.pos_blocks_2[i](h_node, h_edge[edge_num//2:], edge_index[:, edge_num//2:], relative_vec[edge_num//2:], distance[edge_num//2:], edge_time[edge_num//2:])
+                            self.pos_blocks_1[i](h_node, h_edge[mask_edge_l1], edge_index_l1, relative_vec[mask_edge_l1], distance[mask_edge_l1], edge_time_l1) +
+                            self.pos_blocks_2[i](h_node, h_edge[mask_edge_l2], edge_index_l2, relative_vec[mask_edge_l2], distance[mask_edge_l2], edge_time_l2) +
+                            self.pos_blocks_pl[i](h_node, h_edge[mask_edge_pl], edge_index_pl, relative_vec[mask_edge_pl], distance[mask_edge_pl], edge_time_pl)
                             )
-        return h_node, pos_node, h_edge
+        outputs = {'x': pos_node, 'h': h_node}
+        return outputs
 
     def _build_edges_dist(self, pos, edge_index):
         # distance
@@ -279,6 +335,91 @@ class NodeEdgeNet(Module):
         edge_dist = self.distance_expansion(distance)
         return edge_dist, relative_vec, distance
     
+    def _connect_edge(self, x, mask_ligand, batch, loop=False):
+        four_type_edge_index, four_type_edge_batch = batch_hybrid_edge_connection(
+            x, k=self.k, mask_ligand=mask_ligand, batch=batch, add_p_index=True)
+        return four_type_edge_index, four_type_edge_batch
+
+    @staticmethod
+    def _build_edge_type(edge_index, mask_ligand):
+        src, dst = edge_index
+        edge_type = torch.zeros(len(src)).to(edge_index)
+        n_src = mask_ligand[src] == 1
+        n_dst = mask_ligand[dst] == 1
+        edge_type[n_src & n_dst] = 0
+        edge_type[n_src & ~n_dst] = 1
+        edge_type[~n_src & n_dst] = 2
+        edge_type[~n_src & ~n_dst] = 3
+        edge_type = F.one_hot(edge_type, num_classes=4)
+        return edge_type
+
+
+def hybrid_edge_connection(ligand_pos, protein_pos, k, ligand_index, protein_index):
+    # fully-connected for ligand atoms
+    ll1_edge_index_index = torch.tril_indices(len(ligand_index), len(ligand_index), offset=1)
+    # edge_index_index = torch.cat([half_edge_index_index, half_edge_index_index.flip(0)], dim=1)
+    src, dst = ligand_index[ll1_edge_index_index[0]], ligand_index[ll1_edge_index_index[1]]
+    # dst = torch.repeat_interleave(ligand_index, len(ligand_index))
+    # src = ligand_index.repeat(len(ligand_index))
+    # mask = dst != src
+    # dst, src = dst[mask], src[mask]
+    ll1_edge_index = torch.stack([src, dst])
+    ll2_edge_index = ll1_edge_index.flip(0)
+
+    # knn for ligand-protein edges
+    ligand_protein_pos_dist = torch.unsqueeze(ligand_pos, 1) - torch.unsqueeze(protein_pos, 0)
+    ligand_protein_pos_dist = torch.norm(ligand_protein_pos_dist, p=2, dim=-1)
+    knn_p_idx = torch.topk(ligand_protein_pos_dist, k=k, largest=False, dim=1).indices
+    knn_p_idx = protein_index[knn_p_idx]
+    knn_l_idx = torch.unsqueeze(ligand_index, 1)
+    knn_l_idx = knn_l_idx.repeat(1, k)
+    pl_edge_index = torch.stack([knn_p_idx, knn_l_idx], dim=0)
+    pl_edge_index = pl_edge_index.view(2, -1)
+    return ll1_edge_index, ll2_edge_index, pl_edge_index
+
+
+def batch_hybrid_edge_connection(x, k, mask_ligand, batch, add_p_index=False):
+    # four types of edge, L1, L2, PL, PP
+    batch_size = batch.max().item() + 1
+    batch_ll1_edge_index, batch_ll2_edge_index, batch_pl_edge_index, batch_p_edge_index = [], [], [], []
+    batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p = [], [], []
+    with torch.no_grad():
+        for i in range(batch_size):
+            ligand_index = ((batch == i) & (mask_ligand == 1)).nonzero()[:, 0]
+            protein_index = ((batch == i) & (mask_ligand == 0)).nonzero()[:, 0]
+            ligand_pos, protein_pos = x[ligand_index], x[protein_index]
+            ll1_edge_index, ll2_edge_index, pl_edge_index = hybrid_edge_connection(
+                ligand_pos, protein_pos, k, ligand_index, protein_index)
+            batch_ll1_edge_index.append(ll1_edge_index)
+            batch_edge_l1.append(torch.tensor([i] * ll1_edge_index.shape[1]))
+            batch_ll2_edge_index.append(ll2_edge_index)
+            batch_edge_l2.append(torch.tensor([i] * ll2_edge_index.shape[1]))
+            batch_pl_edge_index.append(pl_edge_index)
+            batch_edge_pl.append(torch.tensor([i] * pl_edge_index.shape[1]))
+            if add_p_index:
+                all_pos = torch.cat([protein_pos, ligand_pos], 0)
+                p_edge_index = knn_graph(all_pos, k=k, flow='source_to_target')
+                p_edge_index = p_edge_index[:, p_edge_index[1] < len(protein_pos)]
+                p_src, p_dst = p_edge_index
+                all_index = torch.cat([protein_index, ligand_index], 0)
+                p_edge_index = torch.stack([all_index[p_src], all_index[p_dst]], 0)
+                batch_p_edge_index.append(p_edge_index)
+                batch_edge_p.append(torch.tensor([i] * p_edge_index.shape[1]))
+
+    edge_index_l1 = torch.cat(batch_ll1_edge_index, dim=-1)
+    batch_edge_l1 = torch.cat(batch_edge_l1)
+    edge_index_l2 = torch.cat(batch_ll2_edge_index, dim=-1)
+    batch_edge_l2 = torch.cat(batch_edge_l2)
+    edge_index_pl = torch.cat(batch_pl_edge_index, dim=-1)
+    batch_edge_pl = torch.cat(batch_edge_pl)
+    if add_p_index:
+        # edge_index = [torch.cat([ll, pl, p], -1) for ll, pl, p in zip(
+        #     batch_ll1_edge_index, batch_pl_edge_index, batch_p_edge_index)]
+        edge_index_p = torch.cat(batch_p_edge_index, dim=-1)
+        batch_edge_p = torch.cat(batch_edge_p)
+        return (edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p), (batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p)
+    else:
+        return edge_index_l1, edge_index_l2, edge_index_pl
 
 
 class PosUpdate(Module):

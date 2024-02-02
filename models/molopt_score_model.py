@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 from models.common import compose_context, ShiftedSoftplus
 from models.egnn import EGNN
 from models.uni_transformer import UniTransformerO2TwoUpdateGeneral
+from models.graph_new import MolDiff_new
 
 
 def get_refine_net(refine_net_type, config):
@@ -39,6 +40,14 @@ def get_refine_net(refine_net_type, config):
             num_r_gaussian=1,
             k=config.knn,
             cutoff_mode=config.cutoff_mode
+        )
+    elif refine_net_type == 'MolDiff_new':
+        refine_net = MolDiff_new(
+            node_dim=config.node_dim,
+            edge_dim=config.edge_dim,
+            num_blocks=config.num_blocks,
+            cutoff=config.cutoff,
+            use_gate=config.use_gate,
         )
     else:
         raise ValueError(refine_net_type)
@@ -346,7 +355,7 @@ class ScorePosNet3D(nn.Module):
             batch_ligand=batch_ligand,
         )
 
-        outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x)
+        outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x, time_step=time_step)
         final_pos, final_h = outputs['x'], outputs['h']
         final_ligand_pos, final_ligand_h = final_pos[mask_ligand], final_h[mask_ligand]
         final_ligand_v = self.v_inference(final_ligand_h)

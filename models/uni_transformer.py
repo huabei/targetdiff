@@ -298,7 +298,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         edge_type = F.one_hot(edge_type, num_classes=4)
         return edge_type
 
-    def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False):
+    def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False, time_step=None):
 
         all_x = [x]
         all_h = [h]
