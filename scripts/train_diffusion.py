@@ -10,6 +10,9 @@ from torch.nn.utils import clip_grad_norm_
 from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import Compose
 from tqdm.auto import tqdm
+import sys
+sys.path.append('.')
+print(sys.path)
 
 import utils.misc as misc
 import utils.train as utils_train

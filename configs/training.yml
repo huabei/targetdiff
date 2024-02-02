@@ -46,7 +46,7 @@ train:
   batch_size: 4
   num_workers: 4
   n_acc_batch: 1
-  max_iters: 10000000
+  max_iters: 200000
   val_freq: 100
   pos_noise_std: 0.1
   max_grad_norm: 8.0
