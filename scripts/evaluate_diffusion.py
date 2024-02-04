@@ -43,7 +43,8 @@ if __name__ == '__main__':
     parser.add_argument('--atom_enc_mode', type=str, default='add_aromatic')
     parser.add_argument('--docking_mode', type=str, choices=['qvina', 'vina_score', 'vina_dock', 'none'])
     parser.add_argument('--exhaustiveness', type=int, default=16)
-    args = parser.parse_args()
+    # args = parser.parse_args()
+    args = parser.parse_args([''])
 
     result_path = os.path.join(args.sample_path, 'eval_results')
     os.makedirs(result_path, exist_ok=True)
