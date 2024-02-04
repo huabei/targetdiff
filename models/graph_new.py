@@ -1,12 +1,13 @@
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Module, Sequential, Linear, Conv1d, ModuleList
-from torch_scatter import scatter_sum, scatter_softmax
+from torch_scatter import scatter_sum, scatter_softmax, scatter_mean
 from torch_geometric.nn import radius_graph, knn_graph
 # from models.common import GaussianSmearing, MLP, NONLINEARITIES
 # from torch_cluster import knn
-from models.common import batch_hybrid_edge_connection
+# from models.common import batch_hybrid_edge_connection
 
 NONLINEARITIES = {
     "tanh": nn.Tanh(),
@@ -183,13 +184,15 @@ class EdgeBlock(Module):
 
 
 class MolDiff_new(Module):
-    def __init__(self, node_dim, num_blocks=6, cutoff=15, use_gate=True, **kwargs):
+    def __init__(self, node_dim, num_blocks=6, cutoff=15, use_gate=True, k=16, **kwargs):
         super().__init__()
         self.node_dim = node_dim
         self.edge_dim = 4
         edge_dim = self.edge_dim
         self.cutoff = cutoff
+        self.num_blocks = num_blocks
         self.use_gate = use_gate
+        self.k = k
         self.kwargs = kwargs
 
         if 'num_gaussians' not in kwargs:
@@ -254,21 +257,22 @@ class MolDiff_new(Module):
                 ))
                 
     # def forward(self, h_node, pos_node, h_edge, edge_index, node_time, edge_time):
-    def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False, time_step):
+    def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False, time_step=None):
         # edge_num = edge_index.shape[1]
         pos_node = x
         h_node = h
-        node_time = time_step.index_select(0, batch)
+        node_time = time_step.index_select(0, batch).unsqueeze(-1)/1000
 
         # four types of edge, L1, L2, PL, PP
         four_type_edge_index, four_type_edge_batch = self._connect_edge(
             x, mask_ligand, batch, loop=False)
         edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p = four_type_edge_index
         batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p = four_type_edge_batch
-        edge_time_l1 = time_step.index_select(0, batch_edge_l1)
-        edge_time_l2 = time_step.index_select(0, batch_edge_l2)
-        edge_time_pl = time_step.index_select(0, batch_edge_pl)
-        edge_time_p = time_step.index_select(0, batch_edge_p)
+        # print(time_step.device, batch_edge_l1.device)
+        edge_time_l1 = time_step.index_select(0, batch_edge_l1).unsqueeze(-1)/1000
+        edge_time_l2 = time_step.index_select(0, batch_edge_l2).unsqueeze(-1)/1000
+        edge_time_pl = time_step.index_select(0, batch_edge_pl).unsqueeze(-1)/1000
+        edge_time_p = time_step.index_select(0, batch_edge_p).unsqueeze(-1)/1000
         edge_time = torch.cat([edge_time_l1, edge_time_l2, edge_time_pl, edge_time_p], dim=0)
         # total edge index
         edge_index = torch.cat([edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p], dim=-1)
@@ -292,7 +296,7 @@ class MolDiff_new(Module):
             [0] * (edge_index_l1.shape[1] + edge_index_l2.shape[1] + edge_index_pl.shape[1]) +
             [1] * edge_index_p.shape[1], dtype=torch.bool, device=edge_index.device
         )
-        
+        h_edge = edge_type
         for i in range(self.num_blocks):
             # edge fetures before each block
             # if self.update_pos or (i==0):
@@ -356,7 +360,7 @@ class MolDiff_new(Module):
 
 def hybrid_edge_connection(ligand_pos, protein_pos, k, ligand_index, protein_index):
     # fully-connected for ligand atoms
-    ll1_edge_index_index = torch.tril_indices(len(ligand_index), len(ligand_index), offset=1)
+    ll1_edge_index_index = torch.triu_indices(len(ligand_index), len(ligand_index), offset=1)
     # edge_index_index = torch.cat([half_edge_index_index, half_edge_index_index.flip(0)], dim=1)
     src, dst = ligand_index[ll1_edge_index_index[0]], ligand_index[ll1_edge_index_index[1]]
     # dst = torch.repeat_interleave(ligand_index, len(ligand_index))
@@ -382,7 +386,7 @@ def batch_hybrid_edge_connection(x, k, mask_ligand, batch, add_p_index=False):
     # four types of edge, L1, L2, PL, PP
     batch_size = batch.max().item() + 1
     batch_ll1_edge_index, batch_ll2_edge_index, batch_pl_edge_index, batch_p_edge_index = [], [], [], []
-    batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p = [], [], []
+    batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p = [], [], [], []
     with torch.no_grad():
         for i in range(batch_size):
             ligand_index = ((batch == i) & (mask_ligand == 1)).nonzero()[:, 0]
@@ -406,17 +410,17 @@ def batch_hybrid_edge_connection(x, k, mask_ligand, batch, add_p_index=False):
                 batch_p_edge_index.append(p_edge_index)
                 batch_edge_p.append(torch.tensor([i] * p_edge_index.shape[1]))
 
-    edge_index_l1 = torch.cat(batch_ll1_edge_index, dim=-1)
-    batch_edge_l1 = torch.cat(batch_edge_l1)
-    edge_index_l2 = torch.cat(batch_ll2_edge_index, dim=-1)
-    batch_edge_l2 = torch.cat(batch_edge_l2)
-    edge_index_pl = torch.cat(batch_pl_edge_index, dim=-1)
-    batch_edge_pl = torch.cat(batch_edge_pl)
+    edge_index_l1 = torch.cat(batch_ll1_edge_index, dim=-1).to(x.device)
+    batch_edge_l1 = torch.cat(batch_edge_l1).to(x.device)
+    edge_index_l2 = torch.cat(batch_ll2_edge_index, dim=-1).to(x.device)
+    batch_edge_l2 = torch.cat(batch_edge_l2).to(x.device)
+    edge_index_pl = torch.cat(batch_pl_edge_index, dim=-1).to(x.device)
+    batch_edge_pl = torch.cat(batch_edge_pl).to(x.device)
     if add_p_index:
         # edge_index = [torch.cat([ll, pl, p], -1) for ll, pl, p in zip(
         #     batch_ll1_edge_index, batch_pl_edge_index, batch_p_edge_index)]
-        edge_index_p = torch.cat(batch_p_edge_index, dim=-1)
-        batch_edge_p = torch.cat(batch_edge_p)
+        edge_index_p = torch.cat(batch_p_edge_index, dim=-1).to(x.device)
+        batch_edge_p = torch.cat(batch_edge_p).to(x.device)
         return (edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p), (batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p)
     else:
         return edge_index_l1, edge_index_l2, edge_index_pl

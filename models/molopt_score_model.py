@@ -46,6 +46,7 @@ def get_refine_net(refine_net_type, config):
             node_dim=config.node_dim,
             edge_dim=config.edge_dim,
             num_blocks=config.num_blocks,
+            k=config.knn,
             cutoff=config.cutoff,
             use_gate=config.use_gate,
         )
