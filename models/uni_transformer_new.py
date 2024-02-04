@@ -321,6 +321,7 @@ class UniTransformerNew(nn.Module):
             edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p = four_type_edge_index
             # batch_edge_l1, batch_edge_l2, batch_edge_pl, batch_edge_p = four_type_edge_batch
             edge_index = torch.cat([edge_index_l1, edge_index_l2, edge_index_pl, edge_index_p], dim=-1)
+            src, dst = edge_index
             mask_edge_l1 = torch.tensor(
                 [1] * edge_index_l1.shape[1] +
                 [0] * (edge_index_l2.shape[1] + edge_index_pl.shape[1] + edge_index_p.shape[1]),
@@ -351,10 +352,10 @@ class UniTransformerNew(nn.Module):
                 e_w = None
 
             for l_idx, layer in enumerate(self.base_block):
-                delta_h_l1, delta_x_l1 = layer[0](h, x, edge_type[mask_edge_l1], edge_index_l1, mask_ligand, e_w=e_w, fix_x=fix_x)
-                delta_h_l2, delta_x_l2 = layer[1](h, x, edge_type[mask_edge_l2], edge_index_l2, mask_ligand, e_w=e_w, fix_x=fix_x)
-                delta_h_pl, delta_x_pl = layer[2](h, x, edge_type[mask_edge_pl], edge_index_pl, mask_ligand, e_w=e_w, fix_x=fix_x)
-                delta_h_p, _ = layer[3](h, x, edge_type[mask_edge_p], edge_index_p, mask_ligand, e_w=e_w, fix_x=fix_x)
+                delta_h_l1, delta_x_l1 = layer[0](h, x, edge_type[mask_edge_l1], edge_index_l1, mask_ligand, e_w=e_w[mask_edge_l1], fix_x=fix_x)
+                delta_h_l2, delta_x_l2 = layer[1](h, x, edge_type[mask_edge_l2], edge_index_l2, mask_ligand, e_w=e_w[mask_edge_l2], fix_x=fix_x)
+                delta_h_pl, delta_x_pl = layer[2](h, x, edge_type[mask_edge_pl], edge_index_pl, mask_ligand, e_w=e_w[mask_edge_pl], fix_x=fix_x)
+                delta_h_p, _ = layer[3](h, x, edge_type[mask_edge_p], edge_index_p, mask_ligand, e_w=e_w[mask_edge_p], fix_x=fix_x)
                 h = h + delta_h_l1 + delta_h_l2 + delta_h_pl + delta_h_p
                 x = x + delta_x_l1 + delta_x_l2 + delta_x_pl
             all_x.append(x)
